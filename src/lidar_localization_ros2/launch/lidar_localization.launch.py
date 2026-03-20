@@ -1,83 +1,70 @@
 import os
-
 import launch
 import launch.actions
-import launch.events
-
-import launch_ros
 import launch_ros.actions
-import launch_ros.events
-
 from launch import LaunchDescription
-from launch_ros.actions import LifecycleNode
-from launch_ros.actions import Node
-
+from launch_ros.actions import LifecycleNode, Node
 import lifecycle_msgs.msg
-
 from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
+    ld = LaunchDescription()
 
-    ld = launch.LaunchDescription()
-
-    lidar_tf = launch_ros.actions.Node(
+    # 1. LiDAR to Robot Base
+    lidar_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
         name='lidar_tf',
+        arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'velodyne']
+    )
+
+    # 2. IMU to Robot Base
+    imu_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
-        arguments=['0','0','0','0','0','0','1','base_link','velodyne']
-        )
-
-    imu_tf = launch_ros.actions.Node(
         name='imu_tf',
+        arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'imu_link']
+    )
+
+    # 3. NEW: Map to Odom (The missing link that fixes the Red RViz error)
+    map_to_odom_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
-        arguments=['0','0','0','0','0','0','1','base_link','imu_link']
-        )
+        name='map_to_odom_tf',
+        arguments=['0', '0', '0', '0', '0', '0', 'map', 'odom']
+    )
 
-    localization_param_dir = launch.substitutions.LaunchConfiguration(
-        'localization_param_dir',
-        default=os.path.join(
-            get_package_share_directory('lidar_localization_ros2'),
-            'param',
-            'localization.yaml'))
+    localization_param_dir = os.path.join(
+        get_package_share_directory('lidar_localization_ros2'),
+        'param',
+        'localization.yaml')
 
-    lidar_localization = launch_ros.actions.LifecycleNode(
+    # 4. The Localization Node
+    lidar_localization = LifecycleNode(
         name='lidar_localization',
         namespace='',
         package='lidar_localization_ros2',
         executable='lidar_localization_node',
         parameters=[localization_param_dir],
-        remappings=[('/cloud','/velodyne_points')],
-        output='screen')
+        remappings=[('/cloud', '/velodyne_points')],
+        output='screen'
+    )
 
-    to_inactive = launch.actions.EmitEvent(
+    # 5. Transition: Configure
+    configure_event = launch.actions.EmitEvent(
         event=launch_ros.events.lifecycle.ChangeState(
             lifecycle_node_matcher=launch.events.matches_action(lidar_localization),
             transition_id=lifecycle_msgs.msg.Transition.TRANSITION_CONFIGURE,
         )
     )
 
-    from_unconfigured_to_inactive = launch.actions.RegisterEventHandler(
+    # 6. Transition: Activate (Triggered after configuring)
+    activate_event = launch.actions.RegisterEventHandler(
         launch_ros.event_handlers.OnStateTransition(
             target_lifecycle_node=lidar_localization,
-            goal_state='unconfigured',
-            entities=[
-                launch.actions.LogInfo(msg="-- Unconfigured --"),
-                launch.actions.EmitEvent(event=launch_ros.events.lifecycle.ChangeState(
-                    lifecycle_node_matcher=launch.events.matches_action(lidar_localization),
-                    transition_id=lifecycle_msgs.msg.Transition.TRANSITION_CONFIGURE,
-                )),
-            ],
-        )
-    )
-
-    from_inactive_to_active = launch.actions.RegisterEventHandler(
-        launch_ros.event_handlers.OnStateTransition(
-            target_lifecycle_node=lidar_localization,
-            start_state = 'configuring',
             goal_state='inactive',
             entities=[
-                launch.actions.LogInfo(msg="-- Inactive --"),
+                launch.actions.LogInfo(msg="Node Inactive -> Activating..."),
                 launch.actions.EmitEvent(event=launch_ros.events.lifecycle.ChangeState(
                     lifecycle_node_matcher=launch.events.matches_action(lidar_localization),
                     transition_id=lifecycle_msgs.msg.Transition.TRANSITION_ACTIVATE,
@@ -86,11 +73,12 @@ def generate_launch_description():
         )
     )
 
-    ld.add_action(from_unconfigured_to_inactive)
-    ld.add_action(from_inactive_to_active)
-
-    ld.add_action(lidar_localization)
+    # Add all actions to the description
     ld.add_action(lidar_tf)
-    ld.add_action(to_inactive)
+    ld.add_action(imu_tf)
+    ld.add_action(map_to_odom_tf) # Added this
+    ld.add_action(lidar_localization)
+    ld.add_action(activate_event)
+    ld.add_action(configure_event)
 
     return ld

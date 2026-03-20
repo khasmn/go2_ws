@@ -44,7 +44,7 @@ using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface
 
 CallbackReturn PCLLocalization::on_configure(const rclcpp_lifecycle::State &)
 {
-  RCLCPP_INFO(get_logger(), "Configuring");
+  RCLCPP_INFO(get_logger(), "Configuring...");
 
   initializeParameters();
   initializePubSub();
@@ -52,6 +52,8 @@ CallbackReturn PCLLocalization::on_configure(const rclcpp_lifecycle::State &)
 
   path_ptr_ = std::make_shared<nav_msgs::msg::Path>();
   path_ptr_->header.frame_id = global_frame_id_;
+  
+  corrent_pose_with_cov_stamped_ptr_ = std::make_shared<geometry_msgs::msg::PoseWithCovarianceStamped>();
 
   RCLCPP_INFO(get_logger(), "Configuring end");
   return CallbackReturn::SUCCESS;
@@ -59,15 +61,42 @@ CallbackReturn PCLLocalization::on_configure(const rclcpp_lifecycle::State &)
 
 CallbackReturn PCLLocalization::on_activate(const rclcpp_lifecycle::State &)
 {
-  RCLCPP_INFO(get_logger(), "Activating");
+  RCLCPP_INFO(get_logger(), "Activating... Attempting to load: %s", map_path_.c_str());
 
   pose_pub_->on_activate();
   path_pub_->on_activate();
   initial_map_pub_->on_activate();
 
+  if (use_pcd_map_) {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr map_cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>);
+    
+    // Attempt load
+    if (pcl::io::loadPCDFile<pcl::PointXYZI>(map_path_, *map_cloud_ptr) == -1) {
+      RCLCPP_ERROR(get_logger(), "CRITICAL: Could not read file. Check permissions or format.");
+      return CallbackReturn::FAILURE;
+    }
+
+    // Check if cloud is actually empty
+    if (map_cloud_ptr->points.empty()) {
+      RCLCPP_ERROR(get_logger(), "Loaded map is EMPTY. Point type mismatch?");
+      return CallbackReturn::FAILURE;
+    }
+
+    RCLCPP_INFO(get_logger(), "SUCCESS: Loaded %zu points.", map_cloud_ptr->points.size());
+
+    sensor_msgs::msg::PointCloud2::SharedPtr map_msg_ptr(new sensor_msgs::msg::PointCloud2);
+    pcl::toROSMsg(*map_cloud_ptr, *map_msg_ptr);
+    map_msg_ptr->header.frame_id = global_frame_id_;
+    map_msg_ptr->header.stamp = now();
+    
+    initial_map_pub_->publish(*map_msg_ptr);
+    registration_->setInputTarget(map_cloud_ptr);
+    map_recieved_ = true;
+  }
+
+  // 2. Set Initial Pose automatically if enabled
   if (set_initial_pose_) {
     auto msg = std::make_shared<geometry_msgs::msg::PoseWithCovarianceStamped>();
-
     msg->header.stamp = now();
     msg->header.frame_id = global_frame_id_;
     msg->pose.pose.position.x = initial_pose_x_;
@@ -78,54 +107,8 @@ CallbackReturn PCLLocalization::on_activate(const rclcpp_lifecycle::State &)
     msg->pose.pose.orientation.z = initial_pose_qz_;
     msg->pose.pose.orientation.w = initial_pose_qw_;
 
-    geometry_msgs::msg::PoseStamped::SharedPtr pose_stamped(new geometry_msgs::msg::PoseStamped);
-    pose_stamped->header.stamp = msg->header.stamp;
-    pose_stamped->header.frame_id = global_frame_id_;
-    pose_stamped->pose = msg->pose.pose;
-    path_ptr_->poses.push_back(*pose_stamped);
-
     initialPoseReceived(msg);
-  }
-
-  if (use_pcd_map_) {
-    pcl::PointCloud<pcl::PointXYZI>::Ptr map_cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>);
-    // load a pcd or ply file
-    if (map_path_.rfind(".pcd") != std::string::npos) {
-      RCLCPP_INFO(get_logger(), "Loading pcd map from: %s", map_path_.c_str());
-      if (pcl::io::loadPCDFile(map_path_, *map_cloud_ptr) == -1) {
-        RCLCPP_ERROR(get_logger(), "Failed to load pcd file: %s", map_path_.c_str());
-        return CallbackReturn::FAILURE;
-      }
-    } else if (map_path_.rfind(".ply") != std::string::npos) {
-      RCLCPP_INFO(get_logger(), "Loading ply map from: %s", map_path_.c_str());
-      if (pcl::io::loadPLYFile(map_path_, *map_cloud_ptr) == -1) {
-        RCLCPP_ERROR(get_logger(), "Failed to load ply file: %s", map_path_.c_str());
-        return CallbackReturn::FAILURE;
-      }
-    } else {
-      RCLCPP_ERROR(
-          get_logger(), "Unsupported map file format. Please use .pcd or .ply: %s",
-          map_path_.c_str());
-      return CallbackReturn::FAILURE;
-    }
-
-    RCLCPP_INFO(get_logger(), "Map Size %ld", map_cloud_ptr->size());
-    sensor_msgs::msg::PointCloud2::SharedPtr map_msg_ptr(new sensor_msgs::msg::PointCloud2);
-    pcl::toROSMsg(*map_cloud_ptr, *map_msg_ptr);
-    map_msg_ptr->header.frame_id = global_frame_id_;
-    initial_map_pub_->publish(*map_msg_ptr);
-    RCLCPP_INFO(get_logger(), "Initial Map Published");
-
-    if (registration_method_ == "GICP" || registration_method_ == "GICP_OMP") {
-      pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>());
-      voxel_grid_filter_.setInputCloud(map_cloud_ptr);
-      voxel_grid_filter_.filter(*filtered_cloud_ptr);
-      registration_->setInputTarget(filtered_cloud_ptr);
-    } else {
-      registration_->setInputTarget(map_cloud_ptr);
-    }
-
-    map_recieved_ = true;
+    RCLCPP_INFO(get_logger(), "Auto-Initial Pose set to Launch Parameters.");
   }
 
   RCLCPP_INFO(get_logger(), "Activating end");
@@ -466,167 +449,103 @@ void PCLLocalization::imuReceived(const sensor_msgs::msg::Imu::ConstSharedPtr ms
 
 void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
-  if (!msg) {
-    RCLCPP_WARN(get_logger(), "Received null point cloud message");
+  if (!msg || !map_recieved_ || !initialpose_recieved_) {
     return;
   }
 
-  if (!map_recieved_ || !initialpose_recieved_) {return;}
-  RCLCPP_INFO(get_logger(), "cloudReceived");
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>);
   pcl::fromROSMsg(*msg, *cloud_ptr);
 
-  // If your cloud is not robot-centric, convert to base_frame.
+  // Transform to base_link if necessary
   if (msg->header.frame_id != base_frame_id_) {
-    RCLCPP_DEBUG(
-        this->get_logger(), "Transforming point cloud from %s to %s",
-        msg->header.frame_id.c_str(), base_frame_id_.c_str());
     geometry_msgs::msg::TransformStamped base_to_lidar_stamped;
     try {
       base_to_lidar_stamped = tfbuffer_.lookupTransform(
           base_frame_id_, msg->header.frame_id, msg->header.stamp,
           rclcpp::Duration::from_seconds(0.1));
     } catch (const tf2::TransformException & ex) {
-      RCLCPP_ERROR(
-          this->get_logger(), "Could not transform %s to %s: %s",
-          msg->header.frame_id.c_str(), base_frame_id_.c_str(), ex.what());
+      RCLCPP_ERROR(this->get_logger(), "TF Error: %s", ex.what());
       return;
     }
-
-    Eigen::Matrix4f initial_transformation =
-      tf2::transformToEigen(base_to_lidar_stamped.transform).matrix().cast<float>();
+    Eigen::Matrix4f initial_transformation = tf2::transformToEigen(base_to_lidar_stamped.transform).matrix().cast<float>();
     pcl::PointCloud<pcl::PointXYZI>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZI>());
     pcl::transformPointCloud(*cloud_ptr, *transformed_cloud, initial_transformation);
     cloud_ptr = transformed_cloud;
   }
 
-  if (use_imu_) {
-    double received_time = msg->header.stamp.sec +
-      msg->header.stamp.nanosec * 1e-9;
-    lidar_undistortion_.adjustDistortion(cloud_ptr, received_time);
-  }
-
+  // Pre-processing
   pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>());
   voxel_grid_filter_.setInputCloud(cloud_ptr);
   voxel_grid_filter_.filter(*filtered_cloud_ptr);
 
-  double r;
-  pcl::PointCloud<pcl::PointXYZI> tmp;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr scan_ptr(new pcl::PointCloud<pcl::PointXYZI>());
   for (const auto & p : filtered_cloud_ptr->points) {
-    r = sqrt(pow(p.x, 2.0) + pow(p.y, 2.0));
-    if (scan_min_range_ < r && r < scan_max_range_) {
-      tmp.push_back(p);
+    double r = sqrt(pow(p.x, 2.0) + pow(p.y, 2.0));
+    if (r > scan_min_range_ && r < scan_max_range_) {
+      scan_ptr->push_back(p);
     }
   }
-  pcl::PointCloud<pcl::PointXYZI>::Ptr tmp_ptr(new pcl::PointCloud<pcl::PointXYZI>(tmp));
-  registration_->setInputSource(tmp_ptr);
 
+  registration_->setInputSource(scan_ptr);
+
+  // Align
   Eigen::Affine3d affine;
   tf2::fromMsg(corrent_pose_with_cov_stamped_ptr_->pose.pose, affine);
-
   Eigen::Matrix4f init_guess = affine.matrix().cast<float>();
-
   pcl::PointCloud<pcl::PointXYZI>::Ptr output_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-  rclcpp::Clock system_clock;
-  rclcpp::Time time_align_start = system_clock.now();
+  
   registration_->align(*output_cloud, init_guess);
-  rclcpp::Time time_align_end = system_clock.now();
 
-  bool has_converged = registration_->hasConverged();
-  double fitness_score = registration_->getFitnessScore();
-  if (!has_converged) {
-    RCLCPP_WARN(get_logger(), "The registration didn't converge.");
+  if (!registration_->hasConverged()) {
+    RCLCPP_WARN(get_logger(), "Registration did not converge.");
     return;
   }
-  if (fitness_score > score_threshold_) {
-    RCLCPP_WARN(get_logger(), "The fitness score is over %lf.", score_threshold_);
-  }
 
+  // Update Pose
   Eigen::Matrix4f final_transformation = registration_->getFinalTransformation();
   Eigen::Matrix3d rot_mat = final_transformation.block<3, 3>(0, 0).cast<double>();
   Eigen::Quaterniond quat_eig(rot_mat);
-  geometry_msgs::msg::Quaternion quat_msg = tf2::toMsg(quat_eig);
 
   corrent_pose_with_cov_stamped_ptr_->header.stamp = msg->header.stamp;
-  corrent_pose_with_cov_stamped_ptr_->header.frame_id = global_frame_id_;
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.x = static_cast<double>(final_transformation(0, 3));
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.y = static_cast<double>(final_transformation(1, 3));
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.z = static_cast<double>(final_transformation(2, 3));
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.orientation = quat_msg;
-    
-  // publish here if timer is not enabled
+  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.x = final_transformation(0, 3);
+  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.y = final_transformation(1, 3);
+  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.z = final_transformation(2, 3);
+  corrent_pose_with_cov_stamped_ptr_->pose.pose.orientation = tf2::toMsg(quat_eig);
 
-  if (!enable_timer_publishing_){
+  // Publish Transform
+  if (!enable_timer_publishing_) {
     pose_pub_->publish(*corrent_pose_with_cov_stamped_ptr_);
+    
+    geometry_msgs::msg::TransformStamped t;
+    t.header.stamp = msg->header.stamp;
+    t.header.frame_id = global_frame_id_;
+    t.child_frame_id = base_frame_id_;
+    t.transform.translation.x = corrent_pose_with_cov_stamped_ptr_->pose.pose.position.x;
+    t.transform.translation.y = corrent_pose_with_cov_stamped_ptr_->pose.pose.position.y;
+    t.transform.translation.z = corrent_pose_with_cov_stamped_ptr_->pose.pose.position.z;
+    t.transform.rotation = corrent_pose_with_cov_stamped_ptr_->pose.pose.orientation;
 
-    geometry_msgs::msg::TransformStamped map_to_base_link_stamped;
-    map_to_base_link_stamped.header.stamp = msg->header.stamp;
-    map_to_base_link_stamped.header.frame_id = global_frame_id_;
-    map_to_base_link_stamped.child_frame_id = base_frame_id_;
-    map_to_base_link_stamped.transform.translation.x = static_cast<double>(final_transformation(0, 3));
-    map_to_base_link_stamped.transform.translation.y = static_cast<double>(final_transformation(1, 3));
-    map_to_base_link_stamped.transform.translation.z = static_cast<double>(final_transformation(2, 3));
-    map_to_base_link_stamped.transform.rotation = quat_msg;
     if (!enable_map_odom_tf_) {
-      broadcaster_.sendTransform(map_to_base_link_stamped);
+      broadcaster_.sendTransform(t);
     } else {
-      tf2::Transform map_to_base_link_tf;
-      tf2::fromMsg(map_to_base_link_stamped.transform, map_to_base_link_tf);
-
-      geometry_msgs::msg::TransformStamped odom_to_base_link_msg;
+      // Map -> Odom calculation (Simplified for Go2)
       try {
-        odom_to_base_link_msg = tfbuffer_.lookupTransform(
-          odom_frame_id_, base_frame_id_, msg->header.stamp, rclcpp::Duration::from_seconds(0.1));
+        auto odom_to_base = tfbuffer_.lookupTransform(odom_frame_id_, base_frame_id_, msg->header.stamp, rclcpp::Duration::from_seconds(0.1));
+        tf2::Transform map_to_base_tf, odom_to_base_tf;
+        tf2::fromMsg(t.transform, map_to_base_tf);
+        tf2::fromMsg(odom_to_base.transform, odom_to_base_tf);
+        tf2::Transform map_to_odom_tf = map_to_base_tf * odom_to_base_tf.inverse();
+        
+        geometry_msgs::msg::TransformStamped m2o;
+        m2o.header.stamp = msg->header.stamp;
+        m2o.header.frame_id = global_frame_id_;
+        m2o.child_frame_id = odom_frame_id_;
+        m2o.transform = tf2::toMsg(map_to_odom_tf);
+        broadcaster_.sendTransform(m2o);
       } catch (tf2::TransformException & ex) {
-        RCLCPP_WARN(
-          this->get_logger(), "Could not get transform %s to %s: %s",
-          base_frame_id_.c_str(), odom_frame_id_.c_str(), ex.what());
-        return;
+        RCLCPP_WARN(get_logger(), "Odom TF lookup failed: %s", ex.what());
       }
-      tf2::Transform odom_to_base_link_tf;
-      tf2::fromMsg(odom_to_base_link_msg.transform, odom_to_base_link_tf);
-
-      tf2::Transform map_to_odom_tf = map_to_base_link_tf * odom_to_base_link_tf.inverse();
-      geometry_msgs::msg::TransformStamped map_to_odom_stamped;
-      map_to_odom_stamped.header.stamp = msg->header.stamp;
-      map_to_odom_stamped.header.frame_id = global_frame_id_;
-      map_to_odom_stamped.child_frame_id = odom_frame_id_;
-      map_to_odom_stamped.transform = tf2::toMsg(map_to_odom_tf);
-      broadcaster_.sendTransform(map_to_odom_stamped);
     }
-
-    geometry_msgs::msg::PoseStamped::SharedPtr pose_stamped_ptr(new geometry_msgs::msg::PoseStamped);
-    pose_stamped_ptr->header.stamp = msg->header.stamp;
-    pose_stamped_ptr->header.frame_id = global_frame_id_;
-    pose_stamped_ptr->pose = corrent_pose_with_cov_stamped_ptr_->pose.pose;
-    path_ptr_->poses.push_back(*pose_stamped_ptr);
-    path_pub_->publish(*path_ptr_);
-  }
-
-  last_scan_ptr_ = msg;
-
-  if (enable_debug_) {
-    std::cout << "number of filtered cloud points: " << filtered_cloud_ptr->size() << std::endl;
-    std::cout << "align time:" << time_align_end.seconds() - time_align_start.seconds() <<
-      "[sec]" << std::endl;
-    std::cout << "has converged: " << has_converged << std::endl;
-    std::cout << "fitness score: " << fitness_score << std::endl;
-    std::cout << "final transformation:" << std::endl;
-    std::cout << final_transformation << std::endl;
-    /* delta_angle check
-     * trace(RotationMatrix) = 2(cos(theta) + 1)
-     */
-    double init_cos_angle = 0.5 *
-      (init_guess.coeff(0, 0) + init_guess.coeff(1, 1) + init_guess.coeff(2, 2) - 1);
-    double cos_angle = 0.5 *
-      (final_transformation.coeff(0,
-      0) + final_transformation.coeff(1, 1) + final_transformation.coeff(2, 2) - 1);
-    double init_angle = acos(init_cos_angle);
-    double angle = acos(cos_angle);
-    // Ref:https://twitter.com/Atsushi_twi/status/1185868416864808960
-    double delta_angle = abs(atan2(sin(init_angle - angle), cos(init_angle - angle)));
-    std::cout << "delta_angle:" << delta_angle * 180 / M_PI << "[deg]" << std::endl;
-    std::cout << "-----------------------------------------------------" << std::endl;
   }
 }
 
